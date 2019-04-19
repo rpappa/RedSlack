@@ -2,18 +2,20 @@ const https = require('https');
 const fs = require('fs');
 const querystring = require('querystring');
 const util = require('util');
+const crypto = require('crypto');
 
 const { WebClient } = require('@slack/client');
 const mongo = require('mongodb').MongoClient
 
 const randomName = require('./randomname.js').randomName;
 
-// grab token from environment variables
+// grab environment variabless
 const token = process.env.SLACK_TOKEN;
 const env = process.env.ENV;
 const MODERATION_CHANNEL = process.env.MOD_CHANNEL;
 const MODERATION_AUDIT_CHANNEL = process.env.MOD_AUDIT_CHANNEL;
 const LISTEN_PORT = Number.parseInt(process.env.LISTEN_PORT);
+const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 
 const sslOptions = {
     key: fs.readFileSync('/etc/letsencrypt/live/slack.rpappa.com/privkey.pem'),
@@ -96,7 +98,25 @@ mongo.connect(mongoURL, (err, client) => {
                         body += chunk;
                     });
                     req.on('end', () => {
-                        resolve(querystring.parse(body))
+                        let timestamp = req.headers['x-slack-request-timestamp'];
+                        if(timestamp) {
+                            timestamp = Number.parseInt(timestamp);
+                            // verify the request came in the last 5 minutes
+                            if(Math.abs(timestamp - Date.now()/1000) < 3000) {
+                                let sig_basestring = 'v0:' + timestamp + ':' + body;
+                                let sig = 'v0=' + crypto.createHmac('sha256', SLACK_SIGNING_SECRET)
+                                    .update(sig_basestring)
+                                    .digest('hex');
+
+                                let slack_sig = req.headers['x-slack-signature'];
+                                if(sig === slack_sig) {
+                                    // only passes the body on if the verification passes
+                                    // otherwise the request will probably time out,
+                                    // but that will only affect an attacker so it should be fine
+                                    resolve(querystring.parse(body));
+                                }
+                            }
+                        }
                     });
                 })
             };
