@@ -13,6 +13,7 @@ const token = process.env.SLACK_TOKEN;
 const env = process.env.ENV;
 const MODERATION_CHANNEL = process.env.MOD_CHANNEL;
 const MODERATION_AUDIT_CHANNEL = process.env.MOD_AUDIT_CHANNEL;
+const LISTEN_PORT = Number.parseInt(process.env.LISTEN_PORT);
 
 const sslOptions = {
     key: fs.readFileSync('/etc/letsencrypt/live/slack.rpappa.com/privkey.pem'),
@@ -99,7 +100,7 @@ mongo.connect(mongoURL, (err, client) => {
                     });
                 })
             };
-            
+
             // slash command for anonymous posting
             if (req.url === '/slash/anon') {
                 parse().then((payload) => {
@@ -145,11 +146,11 @@ mongo.connect(mongoURL, (err, client) => {
                             message_ts: payload.message.ts
                         }).then(linkRes => {
                             audit.reportURL = linkRes.permalink;
-                            
+
                             // retrieve the record from the database
-                            reportsCollection.findOne({action_ts: payload.message.ts}).then(record => {
-                                for(let action of payload.actions) {
-                                    switch(action.action_id) {
+                            reportsCollection.findOne({ action_ts: payload.message.ts }).then(record => {
+                                for (let action of payload.actions) {
+                                    switch (action.action_id) {
                                         case 'report_resolve':
                                             audit.action = "allow";
                                             submitModActionAudit(audit).then(auditResult => {
@@ -218,7 +219,7 @@ mongo.connect(mongoURL, (err, client) => {
                                     }
                                 }
 
-                                let contents = `Category: ${category}\nContents: ${(typeof payload.submission.comment === 'string') ? payload.submission.comment : 'Empty'}`
+                                let contents = `Contents: ${(typeof payload.submission.comment === 'string') ? payload.submission.comment : 'Empty'}\nCategory: ${category}`
 
                                 web.chat.getPermalink({
                                     channel: payload.channel.id,
@@ -251,7 +252,7 @@ mongo.connect(mongoURL, (err, client) => {
         } else {
             res.end();
         }
-    }).listen(443);
+    }).listen(LISTEN_PORT);
 
     /**
      * Submit a report to the moderation channel
@@ -303,7 +304,7 @@ mongo.connect(mongoURL, (err, client) => {
                 "action_id": "report_resolve"
             }];
 
-            if(report.message_url != undefined) {
+            if (report.message_url != undefined) {
                 actions.push({
                     "type": "button",
                     "text": {
@@ -328,13 +329,11 @@ mongo.connect(mongoURL, (err, client) => {
                         },
                         mainBlock,
                         {
-                            "type": "context",
-                            "elements": [
-                                {
-                                    "type": "mrkdwn",
-                                    "text": `*Report contents:* ${(report.report_message === undefined) ? 'Empty' : report.report_message}`
-                                }
-                            ]
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": `*Report contents:*\n ${(report.report_message === undefined) ? 'Empty' : report.report_message}`
+                            }
                         },
                         {
                             "type": "actions",
@@ -371,10 +370,10 @@ mongo.connect(mongoURL, (err, client) => {
                     oldest: reportTs,
                     inclusive: true
                 }).then(history => {
-                    for(let message of history.messages) {
+                    for (let message of history.messages) {
                         let newBlocks = [];
-                        for(let block of message.blocks) {
-                            if(block.type != 'actions') {
+                        for (let block of message.blocks) {
+                            if (block.type != 'actions') {
                                 newBlocks.push(block);
                             }
                         }
@@ -393,10 +392,10 @@ mongo.connect(mongoURL, (err, client) => {
                     }
                 });
             })
-            
+
         });
     }
-    
+
     /**
      * Submit a moderation audit
      * @param {Object} audit with the "moderator" and "action" properties 
@@ -406,10 +405,10 @@ mongo.connect(mongoURL, (err, client) => {
             let mod = audit.moderator;
             let modAction = audit.action;
             // convert actions to english
-            if(modAction == 'allow') modAction = 'allowed'
-            else if(modAction == 'remove') modAction = 'removed'
+            if (modAction == 'allow') modAction = 'allowed'
+            else if (modAction == 'remove') modAction = 'removed'
             let report = audit.reportURL;
-    
+
             web.chat.postMessage({
                 channel: MODERATION_AUDIT_CHANNEL,
                 as_user: false,
