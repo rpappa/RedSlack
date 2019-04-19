@@ -5,7 +5,8 @@ const util = require('util');
 const crypto = require('crypto');
 
 const { WebClient } = require('@slack/client');
-const mongo = require('mongodb').MongoClient
+const mongo = require('mongodb').MongoClient;
+const ObjectID = require('mongodb').ObjectID;
 
 const randomName = require('./randomname.js').randomName;
 
@@ -169,6 +170,7 @@ mongo.connect(mongoURL, (err, client) => {
 
                             // retrieve the record from the database
                             reportsCollection.findOne({ action_ts: payload.message.ts }).then(record => {
+                                audit.reportId = record._id;
                                 for (let action of payload.actions) {
                                     switch (action.action_id) {
                                         case 'report_resolve':
@@ -182,6 +184,9 @@ mongo.connect(mongoURL, (err, client) => {
                                             audit.action = "remove";
                                             submitModActionAudit(audit).then(auditResult => {
                                                 closeReport(payload.message.ts, auditResult.audit_ts);
+                                                // uncomment for soft deletion
+                                                // softDelete(record.report.channel_id, record.reported_message_ts)
+
                                                 web.chat.delete({
                                                     channel: record.report.channel_id,
                                                     ts: record.reported_message_ts
@@ -245,21 +250,33 @@ mongo.connect(mongoURL, (err, client) => {
                                     channel: payload.channel.id,
                                     message_ts: JSON.parse(payload.state).message_ts
                                 }).then(linkRes => {
-                                    let report = {
-                                        channel_id: payload.channel.id,
-                                        user_id: payload.user.id,
-                                        message_url: linkRes.permalink,
-                                        report_message: contents
-                                    };
-                                    submitReport(report).then(action => {
-                                        // save a record of this report
-                                        reportsCollection.insertOne({
-                                            report: report,
-                                            reported_message_ts: JSON.parse(payload.state).message_ts,
-                                            action_channel: action.action_channel,
-                                            action_ts: action.action_ts
-                                        })
+                                    web.conversations.history({
+                                        channel: payload.channel.id,
+                                        latest: JSON.parse(payload.state).message_ts,
+                                        oldest: JSON.parse(payload.state).message_ts,
+                                        inclusive: true
+                                    }).then(history => {
+                                        let id = new ObjectID();
+                                        let report = {
+                                            channel_id: payload.channel.id,
+                                            user_id: payload.user.id,
+                                            message_url: linkRes.permalink,
+                                            report_message: contents,
+                                            messages: history.messages,
+                                            id: id.toHexString()
+                                        };
+                                        submitReport(report).then(action => {
+                                            // save a record of this report
+                                            reportsCollection.insertOne({
+                                                _id: id,
+                                                report: report,
+                                                reported_message_ts: JSON.parse(payload.state).message_ts,
+                                                action_channel: action.action_channel,
+                                                action_ts: action.action_ts
+                                            })
+                                        });
                                     })
+                                    
                                 });
                                 break;
                         }
@@ -356,6 +373,15 @@ mongo.connect(mongoURL, (err, client) => {
                             }
                         },
                         {
+                            "type": "context",
+                            "elements": [
+                                {
+                                    "type": "mrkdwn",
+                                    "text": `Report ID: ${report.id}`
+                                }
+                            ]
+                        },
+                        {
                             "type": "actions",
                             "elements": actions
                         }
@@ -429,6 +455,12 @@ mongo.connect(mongoURL, (err, client) => {
             else if (modAction == 'remove') modAction = 'removed'
             let report = audit.reportURL;
 
+            moderationAuditCollection.insertOne({
+                reportId: audit.reportId,
+                mod: audit.moderator,
+                modAction: audit.action
+            })
+
             web.chat.postMessage({
                 channel: MODERATION_AUDIT_CHANNEL,
                 as_user: false,
@@ -438,10 +470,40 @@ mongo.connect(mongoURL, (err, client) => {
             }).then(res => {
                 resolve({
                     audit_ts: res.ts
-                })
+                });
+
+                reportsCollection.findOne({_id: audit.reportId}).then(record => {
+                    // get the original report to include message text with the audit
+                    for(let message of record.report.messages) {
+                        if(message.text && message.user) {
+                            web.chat.postMessage({
+                                channel: MODERATION_AUDIT_CHANNEL,
+                                as_user: false,
+                                username: "Auditor",
+                                icon_emoji: ':file_cabinet:',
+                                thread_ts: res.ts,
+                                text: `*Original message*\n<@${message.user}>: ${message.text}`
+                            })
+                        }
+                    }
+                });
             });
 
             // todo: also save to database
         });
+    }
+
+    /**
+     * "Soft Delete" a message by editing it
+     * Will need to ensure the user doesn't edit it back
+     * @param {String} channel 
+     * @param {Number} messageTs 
+     */
+    function softDelete(channel, messageTs) {
+        web.chat.update({
+            channel: channel,
+            ts: messageTs,
+            text: `[_This message has been removed by a moderator_]` 
+        })
     }
 });
