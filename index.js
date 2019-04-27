@@ -5,6 +5,7 @@ const util = require('util');
 const crypto = require('crypto');
 
 const { WebClient } = require('@slack/client');
+const { RTMClient } = require('@slack/rtm-api');
 const mongo = require('mongodb').MongoClient;
 const ObjectID = require('mongodb').ObjectID;
 
@@ -12,9 +13,11 @@ const randomName = require('./randomname.js').randomName;
 
 // grab environment variabless
 const token = process.env.SLACK_TOKEN;
+const botToken = process.env.SLACK_BOT_TOKEN;
 const env = process.env.ENV;
 const MODERATION_CHANNEL = process.env.MOD_CHANNEL;
 const MODERATION_AUDIT_CHANNEL = process.env.MOD_AUDIT_CHANNEL;
+const MODERATION_MESSAGE_CHANNEL = process.env.MOD_MESSAGE_CHANNEL;
 const LISTEN_PORT = Number.parseInt(process.env.LISTEN_PORT);
 const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 
@@ -27,6 +30,7 @@ const sslOptions = {
 const mongoURL = 'mongodb://localhost:27017'
 
 const web = new WebClient(token);
+const botWeb = new WebClient(botToken);
 let channelList = {};
 
 // grab channel list for hardcoding things such as #moderation and resolving channels
@@ -36,7 +40,7 @@ web.conversations.list({
 }).then(channels => {
     for (let channel of channels.channels) {
         channelList[channel.id] = channel;
-        console.log(`${channel.name}: ${channel.id}`);
+        // console.log(`${channel.name}: ${channel.id}`);
     }
 });
 
@@ -75,7 +79,7 @@ const REPORT_CATEGORIES = [
     }
 ]
 
-mongo.connect(mongoURL, (err, client) => {
+mongo.connect(mongoURL, {useNewUrlParser: true}, (err, client) => {
     if (err) {
         console.error(err);
         return;
@@ -85,7 +89,9 @@ mongo.connect(mongoURL, (err, client) => {
 
     const reportsCollection = db.collection('reports');
     const moderationAuditCollection = db.collection('moderationAudit');
+    const moderatorCollection = db.collection('moderators');
 
+    // http server for handling slash commands, actions etc
     https.createServer(sslOptions, (req, res) => {
         res.setHeader('content-type', 'application/json');
         res.writeHead(200);
@@ -100,17 +106,17 @@ mongo.connect(mongoURL, (err, client) => {
                     });
                     req.on('end', () => {
                         let timestamp = req.headers['x-slack-request-timestamp'];
-                        if(timestamp) {
+                        if (timestamp) {
                             timestamp = Number.parseInt(timestamp);
                             // verify the request came in the last 5 minutes
-                            if(Math.abs(timestamp - Date.now()/1000) < 3000) {
+                            if (Math.abs(timestamp - Date.now() / 1000) < 3000) {
                                 let sig_basestring = 'v0:' + timestamp + ':' + body;
                                 let sig = 'v0=' + crypto.createHmac('sha256', SLACK_SIGNING_SECRET)
                                     .update(sig_basestring)
                                     .digest('hex');
 
                                 let slack_sig = req.headers['x-slack-signature'];
-                                if(sig === slack_sig) {
+                                if (sig === slack_sig) {
                                     // only passes the body on if the verification passes
                                     // otherwise the request will probably time out,
                                     // but that will only affect an attacker so it should be fine
@@ -146,15 +152,85 @@ mongo.connect(mongoURL, (err, client) => {
                     let urls = payload.text.match(/\bhttps?:\/\/\S+/g);
 
                     res.end(`Thank you for your report, it will be considered promptly. ${(urls) ? '' : 'In the future, including a URL to the message (click the ... next to it) helps the mod team. Or, just submit a report from the ... menu on any message and we\'ll include the link for you!'}`);
+                    let id = new ObjectID();
 
-                    submitReport({
+                    let report = {
                         channel_id: payload.channel_id,
                         user_id: payload.user_id,
                         message_url: undefined,
-                        report_message: payload.text
+                        report_message: payload.text,
+                        id: id.toHexString()
+                    }
+
+                    submitReport(report).then(action => {
+                        reportsCollection.insertOne({
+                            _id: id,
+                            report: report,
+                            reported_message_ts: undefined,
+                            action_channel: action.action_channel,
+                            action_ts: action.action_ts
+                        })
                     });
 
                 });
+            } else if (req.url === '/slash/mods') {
+                parse().then(payload => {
+                    getModerators(payload.channel_id).then(mods => {
+                        let channelMods = [];
+                        for(let mod of mods) channelMods.push(mod.user);
+
+                        let message = '';
+                        if(channelMods.length == 0) {
+                            message = 'There are no moderators for this channel!'
+                        } else if(channelMods.length == 1) {
+                            message = `<@${channelMods[0]}> is the only moderator for this channel.`
+                        } else {
+                            message = `The moderators for this channel are `
+                            for(let i = 0; i < channelMods.length - 1; i++) {
+                                if(i > 0) message +=`, `
+                                message += `<@${channelMods[i]}>`
+                            }
+                            if(channelMods.length != 2) message += `,`
+                            message += ` and <@${channelMods[channelMods.length - 1]}>.`
+                        }
+                        message += " Message them by typing `/message-mods [your message here]`. Don't worry, your message will be private!";
+
+                        res.end(message);
+                    });
+                })
+            } else if(req.url === '/slash/messagemods') {
+                parse().then(payload => {
+                    getModerators(payload.channel_id).then(mods => {
+
+                        web.chat.postMessage({
+                            channel: MODERATION_MESSAGE_CHANNEL,
+                            as_user: false,
+                            username: "Messenger",
+                            icon_emoji: ":mailbox_with_mail:",
+                            blocks: [
+                                {type: "divider"},
+                                {
+                                    "type": "section",
+                                    "text": {
+                                        "type": "mrkdwn",
+                                        "text": `<@${payload.user_id}> sent a message: \n>${payload.text}`
+                                    }
+                                },
+                                {
+                                    "type": "context",
+                                    "elements": [
+                                        {
+                                            "type": "mrkdwn",
+                                            "text": `Message sent in <#${payload.channel_id}>`
+                                        }
+                                    ]
+                                }
+                            ]
+                        });
+
+                        res.end(`Your message has been sent, expect a follow-up shortly.`);
+                    });
+                })
             } else if (req.url === '/action') {
                 parse().then(payload => {
                     payload = JSON.parse(payload.payload);
@@ -276,7 +352,7 @@ mongo.connect(mongoURL, (err, client) => {
                                             })
                                         });
                                     })
-                                    
+
                                 });
                                 break;
                         }
@@ -290,6 +366,39 @@ mongo.connect(mongoURL, (err, client) => {
             res.end();
         }
     }).listen(LISTEN_PORT);
+
+    // rtm connection
+    const rtm = new RTMClient(botToken);
+    rtm.start().catch(console.error);
+
+    rtm.on('message', message => {
+        if(!message.text) return;
+        let args = message.text.split(" ");
+        if(args[0] == "!addmod" && args.length >= 3) {
+            web.users.info({
+                user:message.user
+            }).then(info => {
+                if(info.user && info.user.is_admin) {
+                    let channels = [];
+                    let mod = {
+                        user: args[1].replace(/\<|\@|\>/g, ""), // strip out slack user formatting
+                        channels: []
+                    }
+                    for(let i = 2; i < args.length; i++) {
+                        channels.push(args[i].split("|")[0].replace(/\<|\#/g, ''))
+                    }
+                    addModerator(args[1].replace(/\<|\@|\>/g, ""), channels).then(() => {
+                        getModerators().then(mods => {
+                            botWeb.chat.postMessage({
+                                channel: message.channel,
+                                text: JSON.stringify(mods)
+                            })
+                        })
+                    })
+                }
+            })
+        }
+    })
 
     /**
      * Submit a report to the moderation channel
@@ -472,18 +581,20 @@ mongo.connect(mongoURL, (err, client) => {
                     audit_ts: res.ts
                 });
 
-                reportsCollection.findOne({_id: audit.reportId}).then(record => {
+                reportsCollection.findOne({ _id: audit.reportId }).then(record => {
                     // get the original report to include message text with the audit
-                    for(let message of record.report.messages) {
-                        if(message.text && message.user) {
-                            web.chat.postMessage({
-                                channel: MODERATION_AUDIT_CHANNEL,
-                                as_user: false,
-                                username: "Auditor",
-                                icon_emoji: ':file_cabinet:',
-                                thread_ts: res.ts,
-                                text: `*Original message*\n<@${message.user}>: ${message.text}`
-                            })
+                    if (record.report.messages) {
+                        for (let message of record.report.messages) {
+                            if (message.text && message.user) {
+                                web.chat.postMessage({
+                                    channel: MODERATION_AUDIT_CHANNEL,
+                                    as_user: false,
+                                    username: "Auditor",
+                                    icon_emoji: ':file_cabinet:',
+                                    thread_ts: res.ts,
+                                    text: `*Original message*\n<@${message.user}>: ${message.text}`
+                                })
+                            }
                         }
                     }
                 });
@@ -503,7 +614,32 @@ mongo.connect(mongoURL, (err, client) => {
         web.chat.update({
             channel: channel,
             ts: messageTs,
-            text: `[_This message has been removed by a moderator_]` 
+            text: `[_This message has been removed by a moderator_]`
+        })
+    }
+
+    function addModerator(userId, channels) {
+        return new Promise((resolve, reject) => {
+            moderatorCollection.replaceOne({user: userId}, {
+                user: userId,
+                channels: channels
+            }, {upsert: true}).then(resolve);
+        });
+    }
+
+    function getModerators(channel) {
+        return new Promise((resolve, reject) => {
+
+            let mods = [];
+            let cursor = moderatorCollection.find();
+
+            cursor.forEach(doc => {
+                if(!channel || 
+                    (channel && doc.channels.includes('all') || doc.channels.includes(channel)))
+                    mods.push(doc)
+            }).then(() => {
+                resolve(mods)
+            })
         })
     }
 });
