@@ -79,7 +79,7 @@ const REPORT_CATEGORIES = [
     }
 ]
 
-mongo.connect(mongoURL, {useNewUrlParser: true}, (err, client) => {
+mongo.connect(mongoURL, { useNewUrlParser: true }, (err, client) => {
     if (err) {
         console.error(err);
         return;
@@ -90,6 +90,7 @@ mongo.connect(mongoURL, {useNewUrlParser: true}, (err, client) => {
     const reportsCollection = db.collection('reports');
     const moderationAuditCollection = db.collection('moderationAudit');
     const moderatorCollection = db.collection('moderators');
+    const anonCollection = db.collection('anonymous');
 
     // http server for handling slash commands, actions etc
     https.createServer(sslOptions, (req, res) => {
@@ -131,21 +132,47 @@ mongo.connect(mongoURL, {useNewUrlParser: true}, (err, client) => {
             // slash command for anonymous posting
             if (req.url === '/slash/anon') {
                 parse().then((payload) => {
-                    res.end();
-
-                    // todo: add a report button (if we're gonna do this)
-                    web.chat.postMessage(
+                    if (payload.text) {
+                        res.end();
+                        web.chat.postMessage(
                         {
                             channel: payload.channel_id,
                             text: payload.text,
                             as_user: false,
                             username: randomName(),
-                            icon_emoji: ':speaking_head_in_silhouette:'
+                            icon_emoji: ':speaking_head_in_silhouette:',
+                            blocks: [
+                                {
+                                    "type": "section",
+                                    "text": {
+                                        "type": "mrkdwn",
+                                        "text": payload.text
+                                    },
+                                    "accessory": {
+                                        "type": "button",
+                                        "text": {
+                                            "type": "plain_text",
+                                            "text": "Report"
+                                        },
+                                        "value": "message_report",
+                                        "action_id": "message_report",
+                                        "style": "danger"
+                                    }
+                                }
+                            ]
                         }).then((postRes => {
+                            anonCollection.insertOne({
+                                user: payload.user_id,
+                                message: payload.text,
+                                ts: postRes.message.ts
+                            })
                             // todo: auditing of some sort
                         }));
+                    } else {
+                        res.end('Please include a message text! `/anon [your message here]`');
+                    }
 
-                    res.end();
+                    
                 });
             } else if (req.url === '/slash/report') {
                 parse().then((payload) => {
@@ -177,20 +204,20 @@ mongo.connect(mongoURL, {useNewUrlParser: true}, (err, client) => {
                 parse().then(payload => {
                     getModerators(payload.channel_id).then(mods => {
                         let channelMods = [];
-                        for(let mod of mods) channelMods.push(mod.user);
+                        for (let mod of mods) channelMods.push(mod.user);
 
                         let message = '';
-                        if(channelMods.length == 0) {
+                        if (channelMods.length == 0) {
                             message = 'There are no moderators for this channel!'
-                        } else if(channelMods.length == 1) {
+                        } else if (channelMods.length == 1) {
                             message = `<@${channelMods[0]}> is the only moderator for this channel.`
                         } else {
                             message = `The moderators for this channel are `
-                            for(let i = 0; i < channelMods.length - 1; i++) {
-                                if(i > 0) message +=`, `
+                            for (let i = 0; i < channelMods.length - 1; i++) {
+                                if (i > 0) message += `, `
                                 message += `<@${channelMods[i]}>`
                             }
-                            if(channelMods.length != 2) message += `,`
+                            if (channelMods.length != 2) message += `,`
                             message += ` and <@${channelMods[channelMods.length - 1]}>.`
                         }
                         message += " Message them by typing `/message-mods [your message here]`. Don't worry, your message will be private!";
@@ -198,7 +225,7 @@ mongo.connect(mongoURL, {useNewUrlParser: true}, (err, client) => {
                         res.end(message);
                     });
                 })
-            } else if(req.url === '/slash/messagemods') {
+            } else if (req.url === '/slash/messagemods') {
                 parse().then(payload => {
                     getModerators(payload.channel_id).then(mods => {
 
@@ -208,12 +235,12 @@ mongo.connect(mongoURL, {useNewUrlParser: true}, (err, client) => {
                             username: "Messenger",
                             icon_emoji: ":mailbox_with_mail:",
                             blocks: [
-                                {type: "divider"},
+                                { type: "divider" },
                                 {
                                     "type": "section",
                                     "text": {
                                         "type": "mrkdwn",
-                                        "text": `<@${payload.user_id}> sent a message: \n>${payload.text}`
+                                        "text": `<@${payload.user_id}> sent a message: \n > ${payload.text}`
                                     }
                                 },
                                 {
@@ -234,80 +261,57 @@ mongo.connect(mongoURL, {useNewUrlParser: true}, (err, client) => {
             } else if (req.url === '/action') {
                 parse().then(payload => {
                     payload = JSON.parse(payload.payload);
+                    console.log(payload)
                     if (payload.type && payload.type === 'block_actions') {
-                        let audit = {
-                            moderator: payload.user.id
-                        }
-                        web.chat.getPermalink({
-                            channel: payload.channel.id,
-                            message_ts: payload.message.ts
-                        }).then(linkRes => {
-                            audit.reportURL = linkRes.permalink;
-
-                            // retrieve the record from the database
-                            reportsCollection.findOne({ action_ts: payload.message.ts }).then(record => {
-                                audit.reportId = record._id;
-                                for (let action of payload.actions) {
-                                    switch (action.action_id) {
-                                        case 'report_resolve':
-                                            audit.action = "allow";
-                                            submitModActionAudit(audit).then(auditResult => {
-                                                closeReport(payload.message.ts, auditResult.audit_ts);
-                                            });
-                                            break;
-
-                                        case 'report_remove':
-                                            audit.action = "remove";
-                                            submitModActionAudit(audit).then(auditResult => {
-                                                closeReport(payload.message.ts, auditResult.audit_ts);
-                                                // uncomment for soft deletion
-                                                // softDelete(record.report.channel_id, record.reported_message_ts)
-
-                                                web.chat.delete({
-                                                    channel: record.report.channel_id,
-                                                    ts: record.reported_message_ts
-                                                });
-                                            });
-                                            break;
-                                    }
+                        for (let action of payload.actions) {
+                            if (action.action_id == 'message_report') {
+                                triggerReportDialog(payload.message.ts, payload.trigger_id);
+                            } else if (action.action_id.includes('report_')) {
+                                let audit = {
+                                    moderator: payload.user.id
                                 }
-                            });
-                        })
+                                web.chat.getPermalink({
+                                    channel: payload.channel.id,
+                                    message_ts: payload.message.ts
+                                }).then(linkRes => {
+                                    audit.reportURL = linkRes.permalink;
+
+                                    // retrieve the record from the database
+                                    reportsCollection.findOne({ action_ts: payload.message.ts }).then(record => {
+                                        audit.reportId = record._id;
+                                        switch (action.action_id) {
+                                            case 'report_resolve':
+                                                audit.action = "allow";
+                                                submitModActionAudit(audit).then(auditResult => {
+                                                    closeReport(payload.message.ts, auditResult.audit_ts);
+                                                });
+                                                break;
+
+                                            case 'report_remove':
+                                                audit.action = "remove";
+                                                submitModActionAudit(audit).then(auditResult => {
+                                                    closeReport(payload.message.ts, auditResult.audit_ts);
+                                                    // uncomment for soft deletion
+                                                    // softDelete(record.report.channel_id, record.reported_message_ts)
+
+                                                    web.chat.delete({
+                                                        channel: record.report.channel_id,
+                                                        ts: record.reported_message_ts
+                                                    });
+                                                });
+                                                break;
+                                        }
+
+                                    });
+                                })
+                            }
+                        }
                         res.end();
                     } else {
                         switch (payload.callback_id) {
                             case 'message_report':
                                 res.end();
-                                let state = {
-                                    message_ts: payload.message_ts
-                                }
-                                web.dialog.open(
-                                    {
-                                        trigger_id: payload.trigger_id,
-                                        dialog: {
-                                            title: 'Report a message',
-                                            callback_id: 'report_submit',
-                                            state: JSON.stringify(state),
-                                            elements: [
-                                                {
-                                                    'label': 'Report Category',
-                                                    'type': 'select',
-                                                    'name': 'category',
-                                                    'options': REPORT_CATEGORIES
-                                                },
-                                                {
-                                                    "label": "Additional information",
-                                                    "name": "comment",
-                                                    "type": "textarea",
-                                                    "optional": true,
-                                                    "hint": 'Provide additional information if needed. If you chose "Other" as the report category, we highly reccomend you write something here.'
-                                                }
-                                            ]
-                                        }
-                                    }
-                                ).then(res => {
-                                    // todo maybe do something?
-                                });
+                                triggerReportDialog(payload.message_ts, payload.trigger_id);
                                 break;
                             case 'report_submit':
                                 res.end();
@@ -333,6 +337,7 @@ mongo.connect(mongoURL, {useNewUrlParser: true}, (err, client) => {
                                         inclusive: true
                                     }).then(history => {
                                         let id = new ObjectID();
+                                        console.log(history.messages);
                                         let report = {
                                             channel_id: payload.channel.id,
                                             user_id: payload.user.id,
@@ -372,33 +377,102 @@ mongo.connect(mongoURL, {useNewUrlParser: true}, (err, client) => {
     rtm.start().catch(console.error);
 
     rtm.on('message', message => {
-        if(!message.text) return;
+        if (!message.text) return;
         let args = message.text.split(" ");
-        if(args[0] == "!addmod" && args.length >= 3) {
-            web.users.info({
-                user:message.user
-            }).then(info => {
-                if(info.user && info.user.is_admin) {
-                    let channels = [];
-                    let mod = {
-                        user: args[1].replace(/\<|\@|\>/g, ""), // strip out slack user formatting
-                        channels: []
-                    }
-                    for(let i = 2; i < args.length; i++) {
-                        channels.push(args[i].split("|")[0].replace(/\<|\#/g, ''))
-                    }
-                    addModerator(args[1].replace(/\<|\@|\>/g, ""), channels).then(() => {
-                        getModerators().then(mods => {
-                            botWeb.chat.postMessage({
-                                channel: message.channel,
-                                text: JSON.stringify(mods)
+        web.users.info({
+            user: message.user
+        }).then(info => {
+            if (info.user) {
+                if (args.length >= 3 && args[0] == "!addmod") {
+                    if (info.user.is_admin) {
+                        let channels = [];
+                        let mod = {
+                            user: args[1].replace(/\<|\@|\>/g, ""), // strip out slack user formatting
+                            channels: []
+                        }
+                        for (let i = 2; i < args.length; i++) {
+                            channels.push(args[i].split("|")[0].replace(/\<|\#/g, ''))
+                        }
+                        addModerator(args[1].replace(/\<|\@|\>/g, ""), channels).then(() => {
+                            getModerators().then(mods => {
+                                botWeb.chat.postMessage({
+                                    channel: message.channel,
+                                    text: JSON.stringify(mods)
+                                })
                             })
                         })
-                    })
+                    }
+                } else if (args.length == 2 && args[0] == "!who") {
+                    if (info.user.is_admin) {
+                        let urlParts = args[1].split("/");
+                        if (urlParts.length > 2) {
+                            // try parsing the last part
+                            let lastPart = urlParts.pop().replace('p', '').replace('>', '');
+                            let ts = lastPart.substring(0, lastPart.length - 6) + '.' + lastPart.substring(lastPart.length - 6);
+
+                            anonCollection.findOne({ ts: ts }).then(doc => {
+                                if (doc.user) {
+                                    botWeb.chat.postMessage({
+                                        channel: message.channel,
+                                        text: `Message posted by <@${doc.user}>`
+                                    });
+
+                                    web.chat.postMessage({
+                                        channel: MODERATION_AUDIT_CHANNEL,
+                                        as_user: false,
+                                        username: "Auditor",
+                                        icon_emoji: ':file_cabinet:',
+                                        text: `<@${message.user}> revealed the sender of ${args[1]}`
+                                    })
+                                } else {
+                                    botWeb.chat.postMessage({
+                                        channel: message.channel,
+                                        text: `Couldn't determine who posted!   `
+                                    });
+                                }
+                            });
+
+                        }
+                    }
                 }
-            })
-        }
+            }
+        }).catch(err => {
+            // do nothing it's probably from getting the bots own message
+        })
     })
+
+    function triggerReportDialog(reportedMessageTs, triggerId) {
+        let state = {
+            message_ts: reportedMessageTs
+        }
+        web.dialog.open(
+            {
+                trigger_id: triggerId,
+                dialog: {
+                    title: 'Report a message',
+                    callback_id: 'report_submit',
+                    state: JSON.stringify(state),
+                    elements: [
+                        {
+                            'label': 'Report Category',
+                            'type': 'select',
+                            'name': 'category',
+                            'options': REPORT_CATEGORIES
+                        },
+                        {
+                            "label": "Additional information",
+                            "name": "comment",
+                            "type": "textarea",
+                            "optional": true,
+                            "hint": 'Provide additional information if needed. If you chose "Other" as the report category, we highly reccomend you write something here.'
+                        }
+                    ]
+                }
+            }
+        ).then(res => {
+            // todo maybe do something?
+        });
+    }
 
     /**
      * Submit a report to the moderation channel
@@ -585,14 +659,16 @@ mongo.connect(mongoURL, {useNewUrlParser: true}, (err, client) => {
                     // get the original report to include message text with the audit
                     if (record.report.messages) {
                         for (let message of record.report.messages) {
-                            if (message.text && message.user) {
+                            if (message.text && (message.user || message.bot_id)) {
                                 web.chat.postMessage({
                                     channel: MODERATION_AUDIT_CHANNEL,
                                     as_user: false,
                                     username: "Auditor",
                                     icon_emoji: ':file_cabinet:',
                                     thread_ts: res.ts,
-                                    text: `*Original message*\n<@${message.user}>: ${message.text}`
+                                    text: `*Original message*\n<@${(message.user) ? message.user : "anon"}>: ${message.text}`
+                                }).then(res => {
+
                                 })
                             }
                         }
@@ -620,10 +696,10 @@ mongo.connect(mongoURL, {useNewUrlParser: true}, (err, client) => {
 
     function addModerator(userId, channels) {
         return new Promise((resolve, reject) => {
-            moderatorCollection.replaceOne({user: userId}, {
+            moderatorCollection.replaceOne({ user: userId }, {
                 user: userId,
                 channels: channels
-            }, {upsert: true}).then(resolve);
+            }, { upsert: true }).then(resolve);
         });
     }
 
@@ -634,7 +710,7 @@ mongo.connect(mongoURL, {useNewUrlParser: true}, (err, client) => {
             let cursor = moderatorCollection.find();
 
             cursor.forEach(doc => {
-                if(!channel || 
+                if (!channel ||
                     (channel && doc.channels.includes('all') || doc.channels.includes(channel)))
                     mods.push(doc)
             }).then(() => {
