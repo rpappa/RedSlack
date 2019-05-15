@@ -20,6 +20,7 @@ const MODERATION_AUDIT_CHANNEL = process.env.MOD_AUDIT_CHANNEL;
 const MODERATION_MESSAGE_CHANNEL = process.env.MOD_MESSAGE_CHANNEL;
 const LISTEN_PORT = Number.parseInt(process.env.LISTEN_PORT);
 const SLACK_SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
+const ALLOW_ANON_CHANNELS = process.env.ALLOW_ANON_CHANNELS.split(',');
 
 const sslOptions = {
     key: fs.readFileSync('/etc/letsencrypt/live/slack.rpappa.com/privkey.pem'),
@@ -133,46 +134,51 @@ mongo.connect(mongoURL, { useNewUrlParser: true }, (err, client) => {
             if (req.url === '/slash/anon') {
                 parse().then((payload) => {
                     if (payload.text) {
-                        res.end();
-                        web.chat.postMessage(
-                        {
-                            channel: payload.channel_id,
-                            text: payload.text,
-                            as_user: false,
-                            username: randomName(),
-                            icon_emoji: ':speaking_head_in_silhouette:',
-                            blocks: [
+                        if (ALLOW_ANON_CHANNELS.includes(payload.channel_id)) {
+                            res.end();
+                            web.chat.postMessage(
                                 {
-                                    "type": "section",
-                                    "text": {
-                                        "type": "mrkdwn",
-                                        "text": payload.text
-                                    },
-                                    "accessory": {
-                                        "type": "button",
-                                        "text": {
-                                            "type": "plain_text",
-                                            "text": "Report"
-                                        },
-                                        "value": "message_report",
-                                        "action_id": "message_report",
-                                        "style": "danger"
-                                    }
-                                }
-                            ]
-                        }).then((postRes => {
-                            anonCollection.insertOne({
-                                user: payload.user_id,
-                                message: payload.text,
-                                ts: postRes.message.ts
-                            })
-                            // todo: auditing of some sort
-                        }));
+                                    channel: payload.channel_id,
+                                    text: payload.text,
+                                    as_user: false,
+                                    username: randomName(),
+                                    icon_emoji: ':speaking_head_in_silhouette:',
+                                    blocks: [
+                                        {
+                                            "type": "section",
+                                            "text": {
+                                                "type": "mrkdwn",
+                                                "text": payload.text
+                                            },
+                                            "accessory": {
+                                                "type": "button",
+                                                "text": {
+                                                    "type": "plain_text",
+                                                    "text": "Report"
+                                                },
+                                                "value": "message_report",
+                                                "action_id": "message_report",
+                                                "style": "danger"
+                                            }
+                                        }
+                                    ]
+                                }).then((postRes => {
+                                    anonCollection.insertOne({
+                                        user: payload.user_id,
+                                        message: payload.text,
+                                        ts: postRes.message.ts
+                                    })
+                                    // todo: auditing of some sort
+                                }));
+                        } else {
+                            res.end('Anonymous messages are not allowed in this channel!');
+                        }
+
                     } else {
                         res.end('Please include a message text! `/anon [your message here]`');
                     }
 
-                    
+
                 });
             } else if (req.url === '/slash/report') {
                 parse().then((payload) => {
@@ -261,7 +267,6 @@ mongo.connect(mongoURL, { useNewUrlParser: true }, (err, client) => {
             } else if (req.url === '/action') {
                 parse().then(payload => {
                     payload = JSON.parse(payload.payload);
-                    console.log(payload)
                     if (payload.type && payload.type === 'block_actions') {
                         for (let action of payload.actions) {
                             if (action.action_id == 'message_report') {
@@ -337,7 +342,6 @@ mongo.connect(mongoURL, { useNewUrlParser: true }, (err, client) => {
                                         inclusive: true
                                     }).then(history => {
                                         let id = new ObjectID();
-                                        console.log(history.messages);
                                         let report = {
                                             channel_id: payload.channel.id,
                                             user_id: payload.user.id,

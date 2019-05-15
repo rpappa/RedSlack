@@ -17,6 +17,7 @@ module.exports = {
       MOD_CHANNEL: "[insert channel id here]",
       MOD_AUDIT_CHANNEL: "[insert channel id here]",
       MOD_MESSAGE_CHANNEL: "[insert channel id here]",
+      ALLOW_ANON_CHANNELS: "[comma],[separated],[channel],[id(s)]",
       LISTEN_PORT: "8080"
     }, // settings for prod
     env_production: {
@@ -27,6 +28,7 @@ module.exports = {
       MOD_CHANNEL: "[insert channel id here]",
       MOD_AUDIT_CHANNEL: "[insert channel id here]",
       MOD_MESSAGE_CHANNEL: "[insert channel id here]",
+      ALLOW_ANON_CHANNELS: "[comma],[separated],[channel],[id(s)]",
       LISTEN_PORT: "443"
     }
   }]
